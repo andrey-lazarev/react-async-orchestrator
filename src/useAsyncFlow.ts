@@ -30,10 +30,13 @@ export type UseAsyncFlowOptions<T> = {
 export type UseAsyncFlowReturn<T> = {
   run: () => Promise<T | undefined>;
   status: "idle" | "running" | "success" | "error" | "cancelled";
-  result?: T;
+  result: T | null;
   error?: any;
   cancel: () => void;
 };
+
+const DEFAULT_RETRIES = 3;
+const DEFAULT_DELAY_MS = 300;
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -49,11 +52,50 @@ async function pTimeout<T>(p: Promise<T>, ms: number) {
   }
 }
 
+// Helper function to create spawn utilities with abort signal
+const makeSpawn = (signal: AbortSignal): SpawnHelpers => ({
+  parallel: (tasks) =>
+    Promise.all(
+      tasks.map((task) =>
+        signal.aborted ? Promise.reject(new Error("aborted")) : task()
+      )
+    ),
+
+  sequence: async (tasks) => {
+    const results = [];
+
+    for (const task of tasks) {
+      if (signal.aborted) throw new Error("aborted");
+      results.push(await task());
+    }
+    return results;
+  },
+
+  race: (tasks) => Promise.race(tasks.map((task) => task())),
+
+  retry: async (fn, retries = DEFAULT_RETRIES, delayMs = DEFAULT_DELAY_MS) => {
+    let lastError;
+
+    for (let attempt = 0; attempt < retries; attempt++) {
+      if (signal.aborted) throw new Error("aborted");
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        if (attempt < retries - 1) await delay(delayMs);
+      }
+    }
+    throw lastError;
+  },
+
+  timeout: (fn, ms) => pTimeout(fn(), ms),
+});
+
 export function useAsyncFlow<T>(
   opts: UseAsyncFlowOptions<T>
 ): UseAsyncFlowReturn<T> {
   const {
-    run: userRun,
+    run,
     deps = [],
     auto = true,
     onError,
@@ -62,96 +104,64 @@ export function useAsyncFlow<T>(
   } = opts;
 
   const [status, setStatus] = React.useState<UseAsyncFlowReturn<T>["status"]>("idle");
-  const [result, setResult] = React.useState(null);
-  const [error, setError] = React.useState(null);
+  const [result, setResult] = React.useState<T | null>(null);
+  const [error, setError] = React.useState<any>(null);
 
-  const abortRef = React.useRef<AbortController | null>(null);
-  const mounted = React.useRef(true);
+  // Refs for abort controller and mount status
+  const abortControllerRef = React.useRef<AbortController | null>(null);
+  const isMountedRef = React.useRef(true);
 
-// mount/unmount
+  // Handle component mount/unmount
   React.useEffect(() => {
-    mounted.current = true;
+    isMountedRef.current = true;
     return () => {
-      mounted.current = false;
-      abortRef.current?.abort();
-      abortRef.current = null;
+      isMountedRef.current = false;
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
     };
   }, []);
 
-  // Spawn helpers
-  const makeSpawn = (signal: AbortSignal): SpawnHelpers => ({
-    parallel: (tasks) =>
-      Promise.all(
-        tasks.map((t) =>
-          signal.aborted ? Promise.reject(new Error("aborted")) : t()
-        )
-      ),
+  // Core async runner function
+  const executeRun = React.useCallback(async () => {
+    // Cancel any previous run
+    abortControllerRef.current?.abort();
 
-    sequence: async (tasks) => {
-      const out = [];
-  
-      for (const t of tasks) {
-        if (signal.aborted) throw new Error("aborted");
-        out.push(await t());
-      }
-      return out;
-    },
+    // Create new abort controller for this run
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
-    race: (tasks) => Promise.race(tasks.map((t) => t())),
-
-    retry: async (fn, retries = 3, delayMs = 300) => {
-      let lastErr;
-
-      for (let i = 0; i < retries; i++) {
-        if (signal.aborted) throw new Error("aborted");
-        try {
-          return await fn();
-        } catch (e) {
-          lastErr = e;
-          if (i < retries - 1) await delay(delayMs);
-        }
-      }
-      throw lastErr;
-    },
-
-    timeout: (fn, ms) => pTimeout(fn(), ms),
-  });
-
-  // Core runner
-
-  const doRun = React.useCallback(async () => {
-    abortRef.current?.abort();
-
-    const ac = new AbortController();
-    abortRef.current = ac;
-
+    // Reset state for new run
     setStatus("running");
     setError(null);
     setResult(null);
 
-    const ctx: AsyncFlowContext = {
-      signal: ac.signal,
-      cancelled: () => ac.signal.aborted || !mounted.current,
-      spawn: makeSpawn(ac.signal),
+    // Create context with abort signal and spawn helpers
+    const context: AsyncFlowContext = {
+      signal: abortController.signal,
+      cancelled: () => abortController.signal.aborted || !isMountedRef.current,
+      spawn: makeSpawn(abortController.signal),
     };
 
     try {
       if (dev) console.log("[RAO] start");
 
-      const res = await Promise.resolve(userRun(ctx));
+      const resultValue = await Promise.resolve(run(context));
 
-      if (ctx.cancelled()) {
+      // Check if cancelled after execution
+      if (context.cancelled()) {
         setStatus("cancelled");
         if (dev) console.log("[RAO] cancelled");
         return;
       }
 
       setStatus("success");
-      setResult(res);
-      if (dev) console.log("[RAO] success", res);
-      return res;
+      setResult(resultValue);
+
+      if (dev) console.log("[RAO] success", resultValue);
+      return resultValue;
     } catch (err) {
-      if (ctx.cancelled()) {
+      // Check if cancelled due to error
+      if (context.cancelled()) {
         setStatus("cancelled");
         return;
       }
@@ -159,27 +169,28 @@ export function useAsyncFlow<T>(
       setStatus("error");
       setError(err);
       onError?.(err);
+
       if (dev) console.error("[RAO] error", err);
       return;
     } finally {
+      // Cleanup
       onFinally?.();
-      if (abortRef.current === ac) abortRef.current = null;
+      if (abortControllerRef.current === abortController) abortControllerRef.current = null;
     }
-  }, [userRun, dev]);
+  }, [run, dev, onError, onFinally]);
 
-  // Auto run on deps change
+  // Auto-run effect when dependencies change
   React.useEffect(() => {
-    if (auto) doRun();
-    return () => abortRef.current?.abort();
+
+    if (auto) executeRun();
+    return () => abortControllerRef.current?.abort();
   }, deps);
 
-  // Public API
-
   const cancel = React.useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     setStatus("cancelled");
   }, []);
 
-  return { run: doRun, cancel, status, result, error };
+  return { run: executeRun, cancel, status, result, error };
 }
